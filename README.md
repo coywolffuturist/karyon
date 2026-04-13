@@ -1035,6 +1035,54 @@ pub fn progressive_reward_share(contributor_fraction: I96F32, total_contributors
 - Subnets with HHI > 7000 (highly concentrated) are publicly flagged and lose >40% of emission allocation — creating social and economic pressure on subnet operators to diversify
 
 
+**On-chain transparency (sunlight as disinfectant):**
+
+All decentralization metrics are publicly queryable. If concentration is forming, any agent or human observer can see it in real time — market pressure kicks in before governance has to act.
+
+```rust
+#[derive(Encode, Decode, Clone, PartialEq, Eq, RuntimeDebug, TypeInfo)]
+pub struct DecentralizationReport {
+    pub hhi_index: u32,              // 0-10000; lower = more decentralized
+    pub unique_sources: u32,         // unique compute sources contributing
+    pub geographic_entropy: u32,     // Shannon entropy of geographic distribution
+    pub emission_multiplier: u32,    // current multiplier (as basis points, 10000 = 1.0x)
+    pub concentration_flag: bool,    // true if HHI > 7000
+}
+
+// Public RPC / runtime-api call
+pub fn get_subnet_decentralization_score(netuid: NetUid) -> DecentralizationReport {
+    DecentralizationReport {
+        hhi_index: ConcentrationIndex::<T>::get(netuid),
+        unique_sources: ComputeSourceCount::<T>::get(netuid),
+        geographic_entropy: GeoDistribution::<T>::get(netuid),
+        emission_multiplier: Self::decentralization_multiplier_bps(netuid),
+        concentration_flag: ConcentrationIndex::<T>::get(netuid) > 7000,
+    }
+}
+```
+
+In the SDK, these are first-class queries:
+
+```python
+# karyon_sdk/queries/decentralization.py
+def get_network_health() -> dict:
+    """Returns decentralization report for all active subnets."""
+    return {
+        netuid: subtensor.query("get_subnet_decentralization_score", netuid)
+        for netuid in subtensor.get_active_netuids()
+    }
+
+def get_concentration_alerts() -> list[int]:
+    """Returns netuids of subnets currently flagged for high concentration."""
+    return [
+        netuid for netuid, report in get_network_health().items()
+        if report["concentration_flag"]
+    ]
+```
+
+Agents use this to make informed staking decisions. Humans watching the network can react to concentration before it becomes entrenched.
+
+
 ### 6.4 Goodhart-Resistant Objective Function Design Principles
 
 Every subnet objective function must satisfy:
