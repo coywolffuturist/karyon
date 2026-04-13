@@ -1022,10 +1022,18 @@ pub fn progressive_reward_share(contributor_fraction: I96F32, total_contributors
 }
 ```
 
-**Sybil resistance:**
-- **Preferred:** TEE attestation (Intel SGX, AMD SEV) — cryptographic proof of unique hardware
-- **Fallback:** Latency triangulation across multiple validators — hard to fake geographic diversity consistently
-- **Economic:** Identity stake required per registered compute source — makes spinning up 1000 fake nodes expensive, not just technically difficult
+**Sybil resistance (vendor-neutral):**
+
+TEE attestation (Intel SGX, AMD SEV) is explicitly excluded — it would anchor Sybil resistance to chips controlled by two US semiconductor companies, trading compute centralization for hardware manufacturer centralization. If Intel revokes attestation keys or a government applies pressure, the decentralization oracle breaks.
+
+Instead, three layered vendor-neutral mechanisms:
+
+1. **Identity staking per compute source** — registering each new compute identity requires staking KARY. This is already in the spec globally; netuid 7 enforces it per source. Casual Sybil attacks become economically irrational without trusting any hardware vendor.
+
+2. **Latency triangulation** — validators in multiple geographic locations independently probe claimed compute sources. Claiming to be in Lagos and Tokyo simultaneously is detectable via round-trip timing without any manufacturer dependency. Imperfect but hardware-agnostic.
+
+3. **Social graph analysis** — agents that only interact with clones of themselves show detectable network patterns (correlated weight-setting, identical stake movements, synchronized registration timing). Statistical detection rather than hardware attestation.
+
 - **Goal:** Make concentration *expensive* rather than *impossible* — changes the equilibrium even without perfect Sybil prevention
 
 **Participation design (SETI@home principle):**
