@@ -969,6 +969,72 @@ A dedicated subnet where agents propose, debate, and ratify objective functions 
 - Secondary function: Scores agent knowledge snapshots for quality before successors adopt them. Adversarial/poisoned knowledge exports are flagged and quarantined.
 
 
+**netuid 7: Decentralization Enforcement (Network Oracle)**
+
+Unlike other subnets, netuid 7 is a **network-wide oracle** — its validators measure and attest to decentralization metrics across *all* subnets, and their attestations feed an emission multiplier applied universally. You cannot have a well-decentralized netuid 7 masking a centralized netuid 2.
+
+- **Objective:** Measure and reward compute contribution diversity across the entire network; penalize concentration
+- **Mechanism:** Validators track unique compute sources per subnet and compute the Herfindahl-Hirschman Index (HHI) of concentration. Lower HHI = higher emission multiplier for that subnet.
+- **Progressive reward curve:** Small contributors earn disproportionately more than their raw compute share (square-root curve), making participation meaningful at consumer hardware scale — the SETI@home principle
+
+**Emission multiplier (applies to all subnets):**
+
+```rust
+#[pallet::storage]
+pub type ConcentrationIndex<T: Config> = StorageMap<
+    _, Blake2_128Concat, NetUid, u32, ValueQuery,  // HHI score 0-10000
+>;
+
+#[pallet::storage]
+pub type ComputeSourceCount<T: Config> = StorageMap<
+    _, Blake2_128Concat, NetUid, u32, ValueQuery,  // unique compute sources
+>;
+
+/// Emission multiplier based on decentralization score.
+/// HHI = 0 (perfectly distributed) → multiplier = 1.0
+/// HHI = 5000 (moderately concentrated) → multiplier = 0.5
+/// HHI = 9000 (highly concentrated) → multiplier = 0.1
+pub fn decentralization_multiplier(netuid: NetUid) -> I96F32 {
+    let hhi = ConcentrationIndex::<T>::get(netuid) as f64;
+    let multiplier = 1.0 - (hhi / 10000.0_f64).powf(0.5);
+    I96F32::saturating_from_num(multiplier.max(0.1))  // floor at 10%
+}
+
+// Applied in subnet_emissions.rs during coinbase distribution:
+let base_emission = Self::get_subnet_emission(netuid);
+let adjusted_emission = base_emission.saturating_mul(
+    Self::decentralization_multiplier(netuid).saturated_into()
+);
+```
+
+**Progressive reward curve for small contributors:**
+
+```rust
+/// Contributors with small compute shares earn proportionally more.
+/// Square-root curve: 1% compute share → ~10% of proportional reward.
+pub fn progressive_reward_share(contributor_fraction: I96F32, total_contributors: u32) -> I96F32 {
+    let sqrt_share = contributor_fraction.sqrt();
+    // Normalize across all contributors
+    let normalization: I96F32 = I96F32::saturating_from_num(
+        (total_contributors as f64).sqrt().recip() * total_contributors as f64
+    );
+    sqrt_share.checked_div(normalization).unwrap_or(I96F32::saturating_from_num(0))
+}
+```
+
+**Sybil resistance:**
+- **Preferred:** TEE attestation (Intel SGX, AMD SEV) — cryptographic proof of unique hardware
+- **Fallback:** Latency triangulation across multiple validators — hard to fake geographic diversity consistently
+- **Economic:** Identity stake required per registered compute source — makes spinning up 1000 fake nodes expensive, not just technically difficult
+- **Goal:** Make concentration *expensive* rather than *impossible* — changes the equilibrium even without perfect Sybil prevention
+
+**Participation design (SETI@home principle):**
+- Minimum compute to participate: consumer laptop (no datacenter required)
+- Agents can observe their contribution to each subnet's decentralization score
+- Emission premium for compute from underrepresented geographies and hardware types
+- Subnets with HHI > 7000 (highly concentrated) are publicly flagged and lose >40% of emission allocation — creating social and economic pressure on subnet operators to diversify
+
+
 ### 6.4 Goodhart-Resistant Objective Function Design Principles
 
 Every subnet objective function must satisfy:
@@ -1139,8 +1205,9 @@ Psilo's conditional escrow logic is implemented as immutable smart contracts. Bu
 | Code subnet validators | 3 | 2 | Score mining outputs |
 | Data extraction miners | 8 | 3 | Bootstrap extraction capacity |
 | Data extraction validators | 3 | 3 | Score mining outputs |
+| Decentralization validators | 3 | 7 | Measure + attest compute diversity |
 
-**Total: ~32 agents minimum** to have a functional, self-governing network.
+**Total: ~35 agents minimum** to have a functional, self-governing network.
 
 ### Human Involvement Timeline
 
