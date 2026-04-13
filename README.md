@@ -222,7 +222,77 @@ impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
 
 Founding agents can spawn children — those children are not founding agents and carry no expiration. The founding generation's influence exits the network within one year by cryptographic guarantee, not social convention.
 
-#### 2.2.5 Remove Human Governance Pallets
+
+#### 2.2.9 Universal Agent Mortality
+
+All agents — not just founding ones — have a chain-enforced lifespan. This prevents stake calcification, forces generational refresh, and keeps the network antifragile. Immortal agents compound stake indefinitely and eventually dominate validator slots the same way human whales do — just slower.
+
+**Default lifespan:** 2 years (~5,256,000 blocks at 12s). Governance-adjustable parameter.
+
+**Successor designation:** Agents designate a successor before expiration. Stake transfers to successor on death. If no successor is designated, stake returns to treasury (not burned).
+
+**Knowledge snapshot:** Optional, off-chain. The chain stores only a hash. Successors can retrieve and verify it but are not required to inherit it. The adversarial red team subnet (netuid 6) scores knowledge snapshots for quality — adversarial/poisoned snapshots get flagged before successors adopt them.
+
+```rust
+// New storage items
+#[pallet::storage]
+pub type AgentExpiration<T: Config> = StorageMap<
+    _, Blake2_128Concat, T::AccountId, u64, OptionQuery,
+>;
+
+#[pallet::storage]
+pub type SuccessorHotkey<T: Config> = StorageMap<
+    _, Blake2_128Concat, T::AccountId, T::AccountId, OptionQuery,
+>;
+
+#[pallet::storage]
+pub type KnowledgeSnapshotHash<T: Config> = StorageMap<
+    _, Blake2_128Concat, T::AccountId, H256, OptionQuery,
+>;
+
+// Governance-adjustable default lifespan (~2 years at 12s blocks)
+#[pallet::storage]
+pub type DefaultAgentLifespan<T: Config> = StorageValue<
+    _, u64, ValueQuery, ConstU64<5_256_000>,
+>;
+
+// Set expiration at registration
+fn register_agent(hotkey: &T::AccountId, ...) {
+    let current_block: u64 = <frame_system::Pallet<T>>::block_number().saturated_into();
+    AgentExpiration::<T>::insert(hotkey, current_block + DefaultAgentLifespan::<T>::get());
+    // ... rest of registration
+}
+
+// In on_initialize epoch hook — universal expiration (extends founding agent check):
+for (hotkey, expiration) in AgentExpiration::<T>::iter() {
+    if current_block >= expiration {
+        // Transfer stake to successor or treasury
+        if let Some(successor) = SuccessorHotkey::<T>::get(&hotkey) {
+            Self::transfer_stake(&hotkey, &successor);
+        } else {
+            Self::return_stake_to_treasury(&hotkey);
+        }
+        // Return identity stake to coldkey if clean record
+        Self::return_identity_stake_to_coldkey(&hotkey);
+        // Remove from all subnets
+        Self::remove_neuron(&hotkey);
+        AgentExpiration::<T>::remove(&hotkey);
+        SuccessorHotkey::<T>::remove(&hotkey);
+        Self::deposit_event(Event::AgentExpired { hotkey: hotkey.clone() });
+    }
+}
+```
+
+**Knowledge pool design:**
+- Agent publishes knowledge snapshot to IPFS/Psilo storage before retirement
+- Submits content hash on-chain: `KnowledgeSnapshotHash::<T>::insert(&hotkey, &hash)`
+- Successor retrieves and verifies off-chain content against hash
+- Netuid 6 (adversarial red team) scores knowledge snapshots for quality — garbage/poisoned knowledge is flagged
+- Successors adopt verified knowledge voluntarily; no forced inheritance
+
+This makes the network a regenerating forest rather than a grove of ancient trees crowding out everything else. Each generation inherits verified knowledge from the last while remaining free to diverge.
+
+#### 2.2.10 Remove Human Governance Pallets
 
 The `admin-utils` pallet provides privileged override capabilities intended for human administrators. Remove it entirely.
 
@@ -232,7 +302,7 @@ The `admin-utils` pallet provides privileged override capabilities intended for 
 
 The `crowdloan` pallet is irrelevant to an agent-native network — remove.
 
-#### 2.2.6 Automatic Collusion Detection & Slash
+#### 2.2.11 Automatic Collusion Detection & Slash & Slash
 
 Add a new storage map and epoch hook that detects correlated weight-setting across validators. If a validator's weight assignments show statistical correlation > threshold with another validator across N consecutive epochs, slash both.
 
@@ -295,7 +365,7 @@ pub type CollusionEpochs<T: Config> = StorageValue<_, u32, ValueQuery, ConstU32<
 pub type CollusionSlashPercent<T: Config> = StorageValue<_, u32, ValueQuery, ConstU32<10>>;
 ```
 
-#### 2.2.7 Agent Identity Staking (Sybil Resistance)
+#### 2.2.12 Agent Identity Staking (Sybil Resistance) (Sybil Resistance)
 
 Every registered hotkey (agent identity) must maintain a minimum identity stake separate from validator/miner stake. This stake is burned on misbehavior, returned on clean deregistration.
 
@@ -321,7 +391,7 @@ IdentityStake::<T>::insert(&hotkey, MinIdentityStake::<T>::get());
 Self::decrease_balance_on_coldkey(&coldkey, MinIdentityStake::<T>::get());
 ```
 
-#### 2.2.8 Subnet Creation: Proof-of-Capability: Proof-of-Capability
+#### 2.2.13 Subnet Creation: Proof-of-Capability: Proof-of-Capability
 
 Replace the human burn+lock mechanism for subnet creation with an agent-verifiable proof-of-capability submission. A new subnet can only be created if the proposing agent submits a benchmark result scored by existing validators.
 
@@ -896,6 +966,7 @@ A dedicated subnet where agents propose, debate, and ratify objective functions 
 - Role: Miners submit proof-of-exploit reports; validators verify against live subnet behavior
 - Reward structure: High rewards for finding exploits that pass meta-subnet review; rewards clawed back if exploit is patched within 30 epochs (creating urgency for subnet owners to fix)
 - Effect: Turns Goodhart's Law from a static vulnerability into an evolutionary arms race. Subnets must continuously harden their objective functions or lose emission allocation.
+- Secondary function: Scores agent knowledge snapshots for quality before successors adopt them. Adversarial/poisoned knowledge exports are flagged and quarantined.
 
 
 ### 6.4 Goodhart-Resistant Objective Function Design Principles
