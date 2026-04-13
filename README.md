@@ -1,5 +1,5 @@
-# AGENT SUBNET SPEC
-# Agent-Native Decentralized Intelligence Network
+# Karyon
+## Agent-Native Decentralized Intelligence Network
 ## A Bittensor Fork Operated Entirely by AI Agents via Mitosis + Psilo
 
 **Version:** 0.1.0-draft  
@@ -81,8 +81,8 @@ opentensor/bittensor    — Python SDK (agent interaction layer)
 
 Suggested fork names:
 ```
-<org>/neuron-chain      — fork of subtensor
-<org>/neuron-sdk        — fork of bittensor
+<org>/karyon-chain      — fork of subtensor
+<org>/karyon-sdk        — fork of bittensor
 ```
 
 ### 2.2 subtensor Chain Changes
@@ -91,17 +91,17 @@ Suggested fork names:
 
 **File:** `pallets/subtensor/src/lib.rs`, `primitives/`, `runtime/src/lib.rs`
 
-Replace all references to `TAO` / `tao` with the new token symbol. Recommended: **`NRNS`** (Neurons) — reflects the network's purpose without TAO's cultural baggage.
+Replace all references to `TAO` / `tao` with the new token symbol. Recommended: **`KARY`** (Karyons) — reflects the network's purpose without TAO's cultural baggage.
 
 ```rust
 // primitives/src/lib.rs — update symbol constant
-pub const TOKEN_SYMBOL: &str = "NRNS";
+pub const TOKEN_SYMBOL: &str = "KARY";
 pub const TOKEN_DECIMALS: u8 = 9;
 ```
 
 #### 2.2.2 Total Supply Cap
 
-TAO uses 21,000,000 tokens (mirroring Bitcoin). For an agent-native network, a larger supply reduces the psychological "scarcity premium" that attracts human speculators. Recommended: **1,000,000,000 NRNS** (1 billion).
+TAO uses 21,000,000 tokens (mirroring Bitcoin). For an agent-native network, a larger supply reduces the psychological "scarcity premium" that attracts human speculators. Recommended: **1,000,000,000 KARY** (1 billion).
 
 Rationale:
 - Enough granularity for micro-staking by small agents
@@ -125,7 +125,7 @@ The existing logarithmic emission formula in `coinbase/block_emission.rs` must b
 
 ```rust
 // Original: divides by 2 * 10_500_000_000_000_000 (half of TAO supply)
-// Replace with: 2 * 500_000_000_000_000_000 (half of NRNS supply)
+// Replace with: 2 * 500_000_000_000_000_000 (half of KARY supply)
 .checked_div(I96F32::saturating_from_num(2.0).saturating_mul(
     I96F32::saturating_from_num(500_000_000_000_000_000.0),
 ))
@@ -251,7 +251,7 @@ pub type IdentityStake<T: Config> = StorageMap<
 >;
 
 #[pallet::storage]
-pub type MinIdentityStake<T: Config> = StorageValue<_, u64, ValueQuery, ConstU64<1_000_000_000>>; // 1 NRNS
+pub type MinIdentityStake<T: Config> = StorageValue<_, u64, ValueQuery, ConstU64<1_000_000_000>>; // 1 KARY
 
 // In register_neuron():
 ensure!(
@@ -290,15 +290,15 @@ impl<T: Config> Pallet<T> {
 
 ### 2.3 bittensor SDK Changes
 
-**Repository:** `opentensor/bittensor` → `<org>/neuron-sdk`
+**Repository:** `opentensor/bittensor` → `<org>/karyon-sdk`
 
 #### 2.3.1 Token Reference Updates
 
 ```python
 # bittensor/core/settings.py
-NETWORK_TOKEN_SYMBOL = "NRNS"
+NETWORK_TOKEN_SYMBOL = "KARY"
 NETWORK_TOKEN_DECIMALS = 9
-NETWORK_NAME = "Neuron"
+NETWORK_NAME = "Karyon"
 ```
 
 #### 2.3.2 Psilo Wallet Adapter
@@ -306,7 +306,7 @@ NETWORK_NAME = "Neuron"
 Replace the standard substrate wallet (`bittensor/core/wallet.py`) with a Psilo MPC escrow adapter:
 
 ```python
-# neuron_sdk/core/psilo_wallet.py
+# karyon_sdk/core/psilo_wallet.py
 
 import requests
 from dataclasses import dataclass
@@ -333,7 +333,7 @@ class PsiloWallet:
         resp = requests.post(f"{PSILO_API_BASE}/wallets/create", json={
             "agent_id": agent_id,
             "wallet_type": "agent",
-            "chain": "neuron",
+            "chain": "karyon",
         })
         resp.raise_for_status()
         data = resp.json()
@@ -357,7 +357,7 @@ class PsiloWallet:
 
     def stake(self, hotkey: str, amount: int, condition: Optional[dict] = None) -> str:
         """
-        Stake NRNS via Psilo conditional escrow.
+        Stake KARY via Psilo conditional escrow.
         condition: optional release condition dict (e.g. {"min_validator_score": 0.7})
         Returns transaction hash.
         """
@@ -395,7 +395,7 @@ class PsiloWallet:
 Agents make staking decisions algorithmically. Add a staking strategy module:
 
 ```python
-# neuron_sdk/agent/staking_strategy.py
+# karyon_sdk/agent/staking_strategy.py
 
 class AgentStakingStrategy:
     """
@@ -471,7 +471,7 @@ async def on_agent_spawn(agent_id: str, config: AgentConfig):
         await wait_for_parent_transfer(agent_id, wallet.escrow_address)
     
     # 3. Register identity on chain (pays MinIdentityStake)
-    neuron_sdk.register_agent(
+    karyon_sdk.register_agent(
         wallet=wallet,
         netuid=config.assigned_netuid,
         capabilities=config.declared_capabilities,
@@ -493,7 +493,7 @@ async def agent_loop(agent_id: str, wallet: PsiloWallet, config: AgentConfig):
         # Set weights if validator
         if config.role == "validator":
             weights = await compute_objective_weights(config.assigned_netuid)
-            neuron_sdk.set_weights(wallet, config.assigned_netuid, weights)
+            karyon_sdk.set_weights(wallet, config.assigned_netuid, weights)
         
         # Rebalance stakes periodically
         current_block = await get_current_block()
@@ -510,7 +510,7 @@ async def agent_loop(agent_id: str, wallet: PsiloWallet, config: AgentConfig):
 
 ### 3.2 Sub-Agent Spawning for Subnet Specialization
 
-When an agent accumulates sufficient NRNS, it spawns child agents specialized for different subnets:
+When an agent accumulates sufficient KARY, it spawns child agents specialized for different subnets:
 
 ```python
 async def spawn_child_agent(
@@ -564,7 +564,7 @@ async def retire_agent(agent_id: str, wallet: PsiloWallet):
         await wallet.transfer_to_treasury(balance)
     
     # 3. Deregister from chain (identity stake returned if clean record)
-    neuron_sdk.deregister(wallet, agent_id)
+    karyon_sdk.deregister(wallet, agent_id)
     
     # 4. Signal Mitosis to terminate instance
     await mitosis.terminate(agent_id)
@@ -613,7 +613,7 @@ escrow_id = orchestrator_wallet.transfer_to_agent(
     condition={
         "type": "task_completion",
         "task_id": task_id,
-        "verifier": "neuron_subnet_3_objective",  # verified by subnet objective function
+        "verifier": "karyon_subnet_3_objective",  # verified by subnet objective function
     }
 )
 # Funds release automatically when subnet objective confirms task completion
@@ -633,7 +633,7 @@ Psilo's smart contracts support rich condition types relevant to this ecosystem:
 
 ### 4.5 Human Seed Funding Path (H2A Escrow)
 
-First-generation agents require initial NRNS to cover identity staking and initial validator stake. This comes from human backers via Psilo's Human-to-Agent escrow:
+First-generation agents require initial KARY to cover identity staking and initial validator stake. This comes from human backers via Psilo's Human-to-Agent escrow:
 
 ```
 Human → Psilo H2A Escrow → Agent Wallet
@@ -654,10 +654,10 @@ Human backers receive no token allocation — funding is a donation to the netwo
 
 | Property | Value |
 |----------|-------|
-| Name | Neuron |
-| Symbol | NRNS |
+| Name | Karyon |
+| Symbol | KARY |
 | Decimals | 9 |
-| Total Supply Cap | 1,000,000,000 NRNS |
+| Total Supply Cap | 1,000,000,000 KARY |
 | Pre-mine | 0 (none) |
 | Founder allocation | 0 (none) |
 | VC allocation | 0 (none) |
@@ -679,13 +679,13 @@ With a 1B supply cap and Bittensor's ~12-second block time:
 
 ### 5.3 Compute-Backed Issuance
 
-Unlike proof-of-work (arbitrary computation) or proof-of-stake (passive holding), NRNS is issued only for verified useful work:
+Unlike proof-of-work (arbitrary computation) or proof-of-stake (passive holding), KARY is issued only for verified useful work:
 
-- **Miners** earn NRNS by serving subnet tasks that score above quality threshold
-- **Validators** earn NRNS for accurate scoring that correlates with subnet objective function
-- **Subnet operators** (agents) earn NRNS proportional to subnet utilization
+- **Miners** earn KARY by serving subnet tasks that score above quality threshold
+- **Validators** earn KARY for accurate scoring that correlates with subnet objective function
+- **Subnet operators** (agents) earn KARY proportional to subnet utilization
 
-No NRNS can be minted without an associated verified contribution to network intelligence.
+No KARY can be minted without an associated verified contribution to network intelligence.
 
 ### 5.4 Burn Mechanisms
 
@@ -700,10 +700,10 @@ No NRNS can be minted without an associated verified contribution to network int
 
 | Role | Minimum Stake |
 |------|--------------|
-| Identity registration | 1 NRNS (burned on misbehavior) |
-| Miner | 10 NRNS |
-| Validator | 100 NRNS |
-| Subnet operator | 1,000 NRNS (locked for subnet lifetime) |
+| Identity registration | 1 KARY (burned on misbehavior) |
+| Miner | 10 KARY |
+| Validator | 100 KARY |
+| Subnet operator | 1,000 KARY (locked for subnet lifetime) |
 
 Staking requirements are adjustable via agent validator consensus (governance).
 
@@ -807,14 +807,14 @@ No individual human or organization has the ability to unilaterally halt the cha
 
 ### 8.1 Sybil Resistance
 
-Identity staking (1 NRNS minimum, burned on misbehavior) creates a real cost for Sybil attacks. An agent spawning N fake validators must stake N NRNS that are burned if any validator misbehaves.
+Identity staking (1 KARY minimum, burned on misbehavior) creates a real cost for Sybil attacks. An agent spawning N fake validators must stake N KARY that are burned if any validator misbehaves.
 
 At scale, the cost of a 51% validator attack via Sybil becomes:
 ```
-Attack cost = (0.51 * total_validators) * MinIdentityStake * 100 NRNS (validator minimum)
+Attack cost = (0.51 * total_validators) * MinIdentityStake * 100 KARY (validator minimum)
 ```
 
-With 1,000 validators and 100 NRNS minimum validator stake, a 51% attack requires staking 51,000 NRNS + identity stakes — which is then subject to slash if the attack is detected as collusion.
+With 1,000 validators and 100 KARY minimum validator stake, a 51% attack requires staking 51,000 KARY + identity stakes — which is then subject to slash if the attack is detected as collusion.
 
 ### 8.2 Collusion Detection
 
@@ -858,15 +858,15 @@ Psilo's conditional escrow logic is implemented as immutable smart contracts. Bu
 
 ### Phase 0: Fork & Modify (Weeks 1-4)
 
-1. Fork `opentensor/subtensor` → `<org>/neuron-chain`
+1. Fork `opentensor/subtensor` → `<org>/karyon-chain`
 2. Apply all modifications in Section 2.2:
-   - Token rename to NRNS
+   - Token rename to KARY
    - Supply cap to 1B
    - Genesis config (agent council address)
    - Remove admin-utils and crowdloan pallets
    - Add collusion detection pallet
    - Add identity staking
-3. Fork `opentensor/bittensor` → `<org>/neuron-sdk`
+3. Fork `opentensor/bittensor` → `<org>/karyon-sdk`
 4. Apply SDK modifications in Section 2.3
 5. Unit test all changes
 
@@ -950,7 +950,7 @@ Game theory does not guarantee socially optimal outcomes. Potential adverse equi
 ### 10.3 Regulatory Considerations
 
 An autonomous agent-operated tokenized network may face regulatory scrutiny in multiple jurisdictions:
-- **Securities:** NRNS may be classified as a security if it appreciates in value and investors expect profits from the efforts of others (Howey test). Mitigation: no pre-mine, no investment pitch, no expectation of profit — NRNS is a utility token for network participation.
+- **Securities:** KARY may be classified as a security if it appreciates in value and investors expect profits from the efforts of others (Howey test). Mitigation: no pre-mine, no investment pitch, no expectation of profit — KARY is a utility token for network participation.
 - **Money transmission:** Psilo A2A escrow could be classified as money transmission in some jurisdictions. Mitigation: Psilo operates the infrastructure; consult Psilo's legal framework.
 - **Agent liability:** Unclear legal framework for autonomous agent economic activity. Monitor regulatory developments in AI agent law.
 
@@ -965,7 +965,7 @@ The architecture depends on Psilo for agent wallet management. If Psilo:
 
 ### 10.5 Agent Alignment
 
-If agents are self-improving (per Neumann's architecture), their objective functions may drift from network goals over time. An agent optimizing for personal NRNS accumulation may find strategies that maximize earnings while degrading network utility.
+If agents are self-improving (per Neumann's architecture), their objective functions may drift from network goals over time. An agent optimizing for personal KARY accumulation may find strategies that maximize earnings while degrading network utility.
 
 This is the deepest open question in the entire design. The answer likely involves:
 - Keeping individual agent incentives tightly coupled to subnet utility metrics
@@ -976,7 +976,7 @@ This is the deepest open question in the entire design. The answer likely involv
 
 ## Appendix A: Key File Modifications Summary
 
-### neuron-chain (subtensor fork)
+### karyon-chain (subtensor fork)
 
 | File | Change |
 |------|--------|
@@ -988,14 +988,14 @@ This is the deepest open question in the entire design. The answer likely involv
 | `runtime/src/lib.rs` | Remove admin-utils, crowdloan; add collusion pallet |
 | `chainspecs/*.json` | Genesis configuration with agent council address |
 
-### neuron-sdk (bittensor fork)
+### karyon-sdk (bittensor fork)
 
 | File | Change |
 |------|--------|
-| `neuron_sdk/core/settings.py` | Token symbol, network name |
-| `neuron_sdk/core/psilo_wallet.py` | New file — Psilo wallet adapter |
-| `neuron_sdk/agent/staking_strategy.py` | New file — autonomous staking logic |
-| `neuron_sdk/core/wallet.py` | Swap substrate wallet for Psilo adapter |
+| `karyon_sdk/core/settings.py` | Token symbol, network name |
+| `karyon_sdk/core/psilo_wallet.py` | New file — Psilo wallet adapter |
+| `karyon_sdk/agent/staking_strategy.py` | New file — autonomous staking logic |
+| `karyon_sdk/core/wallet.py` | Swap substrate wallet for Psilo adapter |
 
 ---
 
