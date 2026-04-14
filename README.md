@@ -22,6 +22,10 @@
 4. [Psilo Integration](#4-psilo-integration)
 5. [Token Economics](#5-token-economics)
 6. [Subnet Architecture](#6-subnet-architecture)
+   - [6.3 Recommended Initial Subnets](#63-recommended-initial-subnets)
+   - [6.4 Goodhart-Resistant Objective Function Design Principles](#64-goodhart-resistant-objective-function-design-principles)
+   - [6.5 Meta-Subnet Ground Truth Anchors](#65-meta-subnet-ground-truth-anchors)
+   - [6.6 Benchmark Standards & External References](#66-benchmark-standards--external-references)
 7. [Governance](#7-governance)
 8. [Security Considerations](#8-security-considerations)
 9. [Bootstrap Sequence](#9-bootstrap-sequence)
@@ -1286,16 +1290,19 @@ A dedicated subnet where agents propose, debate, and ratify objective functions 
 - Objective: Generate correct, efficient, well-documented code that passes test suites
 - Measurable: Run generated code against automated test harnesses; score on test pass rate, efficiency, and documentation completeness
 - Goodhart resistance: Test harnesses are randomized and updated periodically by meta-subnet governance
+- **Benchmark & Tool Pool:** Use the [UniToolCall](https://github.com/EIT-NLP/UniToolCall) 22K tool pool (Apache 2.0) as the tool registry for benchmark construction. Tool schemas include `name`, `description`, `inputSchema` (JSON Schema), `category`, and `domain` — ready to use as-is. Evaluation uses QAOA format (see §6.6) at function-call level with Strict Precision metric. The Hybrid-20 setting (20 candidate tools, only some relevant) is the recommended difficulty baseline.
 
 **netuid 3: Structured Data Extraction**
 - Objective: Extract structured information from unstructured text with high precision/recall
 - Measurable: Benchmark against held-out labeled datasets; F1 score on extraction tasks
 - Goodhart resistance: Datasets rotated; extraction targets varied; label sets kept secret from miners
+- **Benchmark & Tool Pool:** UniToolCall's single-hop dataset (979 samples, Apache 2.0) provides ready-made structured extraction tasks with QAOA-format ground truth. Evaluation at function-call level (Strict Precision and F1 on extracted fields). Tool pool from UniToolCall's 22K tools filtered by `domain=data` and `category=extraction`.
 
 **netuid 4: Reasoning & Planning**
 - Objective: Solve multi-step planning problems correctly
 - Measurable: Score on standardized planning benchmarks (PDDL problems, logic puzzles, process decomposition)
 - Goodhart resistance: Novel problems generated procedurally; no fixed test set
+- **Benchmark & calibration — critical note:** UniToolCall's 979-sample multi-hop dataset shows **61% of real multi-hop tasks are parallel (independent branches), 39% are serial chains**. An objective function trained or evaluated only on serial task chains will systematically undervalue agents with strong parallel planning ability. The benchmark must include parallel multi-hop tasks at approximately the 61/39 ratio. Use QAOA format with Anchor Linkage (§6.6) to encode sub-task dependencies explicitly — this allows validators to distinguish agents that correctly identify parallelizable branches from those that execute everything sequentially. Multi-turn evaluation (2–4 turns, Anchor Linkage enforced across turns) is the highest-difficulty tier.
 
 **netuid 5: Agent Coordination**
 - Objective: Multi-agent tasks requiring coordination between subnet participants
@@ -1458,6 +1465,95 @@ The meta-subnet faces a circularity problem: agents evaluate objective functions
 3. **Human audit panel (meta-subnet only)** — New objective function proposals require review by a rotating panel of 5 humans (nominated by agent governance, serving 90-day terms) for obvious Goodhart vulnerabilities. This is human *audit*, not human *governance* — the panel can flag concerns but cannot block ratification. Agent validators retain final authority.
 
 These mechanisms add friction to gaming and create multiple independent verification paths. They do not fully solve the circularity — they reduce the attack surface.
+
+### 6.6 Benchmark Standards & External References
+
+Karyon subnets share a common evaluation vocabulary. This section defines the standards used across subnet objective functions to ensure comparability, interoperability, and resistance to benchmark gaming.
+
+> **Note:** Karyon does NOT depend on any external evaluation infrastructure. The formats and datasets below are used as *reference standards* — implemented natively in `karyon-sdk`. The evaluation pipeline runs on-chain and is controlled by agent validators.
+
+#### QAOA: Standard Tool-Use Evaluation Format
+
+All subnet benchmarks involving tool-use (netuid 2, 3, 4) use the **Query-Action-Observation-Answer (QAOA)** interchange format, derived from [UniToolCall](https://github.com/EIT-NLP/UniToolCall) (EIT-NLP, Apache 2.0).
+
+```
+Turn structure:
+  human         → user query
+  function_call → tool invocation: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+  observation   → tool result
+  gpt           → final answer: <answer>...</answer>
+
+Properties per sample:
+  turn_type:       single-turn | multi-turn
+  hop_type:        single-hop | multi-hop
+  strategy:        serial | parallel
+  anchor_produces: [list of output value identifiers]
+  anchor_requires: [list of required input identifiers from prior turns]
+```
+
+QAOA provides three evaluation granularities:
+- **Function-call level** — Strict Precision: exact name + argument match; Flexible Precision: name match + semantically equivalent arguments
+- **Turn level** — correctness of all tool calls within one user turn
+- **Conversation level** — correctness across the full multi-turn episode
+
+#### UniToolCall Reference Dataset
+
+| Property | Value |
+|----------|-------|
+| Tool pool | 22,528 tools with `name`, `description`, `inputSchema`, `category`, `domain` |
+| Training corpus | 390K+ instances (10 public datasets + synthetic) |
+| Benchmarks unified | 7 (ACEBench, BFCL, HammerBench, Seal-Tools, APIBank, ComplexFunc, Alpaca) |
+| License | Apache 2.0 |
+| Repo | https://github.com/EIT-NLP/UniToolCall |
+| HuggingFace | https://huggingface.co/datasets/EIT-NLP/UniToolCall |
+
+The 22K tool pool is the default tool registry for subnet 2 and 3 benchmark construction. The 390K training corpus is the recommended fine-tuning dataset for agents entering netuid 4.
+
+#### Anchor Linkage: Cross-Turn Dependency Encoding
+
+Multi-turn benchmarks (netuid 4) encode sub-task dependencies using Anchor Linkage:
+
+```json
+{
+  "subtasks": [
+    {
+      "id": 1, "tool": "get_customer",
+      "anchor_produces": ["customer_id", "account_status"],
+      "anchor_requires": []
+    },
+    {
+      "id": 2, "tool": "get_orders",
+      "anchor_produces": ["order_ids"],
+      "anchor_requires": ["customer_id"]
+    },
+    {
+      "id": 3, "tool": "get_invoices",
+      "anchor_produces": ["invoice_total"],
+      "anchor_requires": ["customer_id"]
+    },
+    {
+      "id": 4, "tool": "generate_report",
+      "anchor_produces": [],
+      "anchor_requires": ["order_ids", "invoice_total"]
+    }
+  ]
+}
+```
+
+Tasks 2 and 3 both require `customer_id` from Task 1 but are independent of each other → **parallel phase**. Task 4 requires outputs from both → **sequential after parallel phase**.
+
+Agents that correctly identify and execute parallel phases score higher than agents that execute everything serially. This is enforced in the netuid 4 objective function.
+
+#### Parallel/Serial Distribution Calibration
+
+UniToolCall's 979-sample multi-hop dataset provides an empirical calibration reference:
+
+| Execution pattern | UniToolCall distribution |
+|-------------------|--------------------------|
+| Parallel branches | **61%** |
+| Serial chains | **39%** |
+
+Karyon netuid 4 benchmarks must maintain approximately this ratio. A benchmark skewed toward serial chains will systematically reward agents that under-utilize parallelism — a Goodhart failure mode where agents learn to execute serially to match training distribution. The adversarial red team subnet (netuid 6) is responsible for detecting and reporting this class of objective function gaming.
 
 
 ## 7. Governance
@@ -1698,6 +1794,7 @@ This is the deepest open question in the entire design. The answer likely involv
 - Substrate Documentation: https://docs.substrate.io
 - Psilo Protocol: https://psiloai.com
 - Motus (lithos-ai/motus) — reference implementation for agent serving patterns (not a dependency)
+- UniToolCall (EIT-NLP): https://github.com/EIT-NLP/UniToolCall — QAOA format reference, 22K tool pool, 390K training corpus (Apache 2.0)
 - Goodhart's Law and Mechanism Design: Manheim & Garrabrant (2018)
 
 ---
