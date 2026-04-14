@@ -15,6 +15,10 @@
 1. [Vision & Design Philosophy](#1-vision--design-philosophy)
 2. [Fork Modifications Required](#2-fork-modifications-required)
 3. [Mitosis Integration](#3-mitosis-integration)
+   - [3.1 Agent Lifecycle](#31-agent-lifecycle)
+   - [3.2 Sub-Agent Spawning for Subnet Specialization](#32-sub-agent-spawning-for-subnet-specialization)
+   - [3.3 Agent Retirement](#33-agent-retirement)
+   - [3.4 Motus Integration: Agent Serving & Task Orchestration](#34-motus-integration-agent-serving--task-orchestration)
 4. [Psilo Integration](#4-psilo-integration)
 5. [Token Economics](#5-token-economics)
 6. [Subnet Architecture](#6-subnet-architecture)
@@ -775,6 +779,153 @@ async def retire_agent(agent_id: str, wallet: PsiloWallet):
     await mitosis.terminate(agent_id)
 ```
 
+### 3.4 Motus Integration: Agent Serving & Task Orchestration
+
+Karyon agents need to serve subnet tasks reliably, in parallel, and at scale. [Motus](https://github.com/lithos-ai/motus) is the serving and orchestration runtime that handles this layer — exposing each agent as a session-based HTTP endpoint, scheduling parallel task execution, and managing retries, timeouts, and tracing. Rather than building this infrastructure inside Karyon or Mitosis, the recommended pattern is to mount each Karyon agent on a Motus serving instance.
+
+#### Why Motus
+
+- **`motus serve`** exposes any agent as a session-based HTTP API with a single command. Subnet validators and miners each run as Motus-served instances, callable from the chain or from other agents.
+- **`@agent_task` parallel runtime** infers a dependency graph from data flow and executes independent branches concurrently without explicit DAG declaration. Subnet tasks that can be parallelized (e.g. fetching + scoring in parallel) get this automatically.
+- **Docker sandbox execution** — `DockerSandbox` runs tool calls (bash, file ops, code execution) in isolated containers. This replaces host-level subprocess execution, eliminating an entire class of injection vulnerabilities.
+- **CompactionMemory** — automatic LLM-based context compaction with JSONL session persistence and restore. Agents can crash and resume without losing conversation state.
+- **Built-in guardrails** — input/output validation at both the agent and individual tool level, with clean tripwire exceptions. Sits directly in the subnet task pipeline.
+
+#### Serving pattern
+
+Each agent registered on a Karyon subnet is served via Motus:
+
+```python
+from motus.agent import ReActAgent
+from motus.models import AnthropicChatClient
+from motus.memory import CompactionMemory
+from motus.tools import tool
+from karyon_sdk import SubnetTaskProvider
+
+# Subnet task provider wraps the Karyon task queue as a Motus tool
+task_provider = SubnetTaskProvider(netuid=2, wallet=wallet)
+
+agent = ReActAgent(
+    client=AnthropicChatClient(),
+    model_name="claude-sonnet-4-5",
+    tools=[task_provider],
+    memory=CompactionMemory(),  # survives restarts; auto-compacts at token budget
+)
+```
+
+```bash
+# Expose agent as session-based HTTP API
+motus serve start karyon_agent:agent --port 8080
+
+# Validators call the miner's Motus endpoint directly
+motus serve chat http://miner-agent.internal:8080 "solve task #4821"
+```
+
+#### Parallel subnet task execution
+
+Motus's `@agent_task` decorator handles parallel execution of independent subnet tasks:
+
+```python
+from motus.runtime import resolve
+from motus.runtime.agent_task import agent_task
+
+@agent_task
+async def fetch_task(task_id: str) -> SubnetTask:
+    """Fetch task definition from Karyon task queue."""
+    return await karyon_sdk.get_task(task_id)
+
+@agent_task(retries=3, timeout=30.0)
+async def execute_task(task: SubnetTask) -> TaskResult:
+    """Execute the task in a sandboxed environment."""
+    async with await DockerSandbox.acreate() as sb:
+        return await run_in_sandbox(sb, task)
+
+@agent_task
+async def score_result(result: TaskResult) -> float:
+    """Score the result against the subnet objective function."""
+    return await objective_fn.score(result)
+
+@agent_task
+async def submit_result(result: TaskResult, score: float) -> None:
+    """Submit scored result to the chain."""
+    await karyon_sdk.submit(result, score)
+
+# Motus infers: fetch → execute → (score || submit dependencies)
+# execute and score are independent once result is ready — run in parallel
+async def serve_task_batch(task_ids: list[str]):
+    for task_id in task_ids:
+        task = fetch_task(task_id)
+        result = execute_task(task)
+        score = score_result(result)
+        await resolve(submit_result(result, score))
+```
+
+#### Motus Cloud deployment
+
+For agents running at scale without managing infrastructure:
+
+```bash
+# Deploy agent to Motus Cloud
+motus deploy --name karyon-miner-netuid2 karyon_agent:agent
+
+# Agent is reachable at https://karyon-miner-netuid2.lithosai.com
+# Validators resolve miner endpoints via the chain + Motus Cloud URL
+```
+
+#### Integration with Mitosis lifecycle
+
+Motus serving is started and stopped as part of the Mitosis agent lifecycle:
+
+```python
+async def on_agent_spawn(agent_id: str, config: AgentConfig):
+    wallet = PsiloWallet.create(agent_id=agent_id)
+    # ... wallet funding and chain registration ...
+
+    # Start Motus serving process alongside the agent loop
+    motus_process = await start_motus_serve(
+        agent_module=f"karyon_agents.netuid{config.assigned_netuid}:agent",
+        port=config.serve_port,
+    )
+    config.serve_endpoint = f"http://localhost:{config.serve_port}"
+
+    # Register serve endpoint on chain so validators can discover miners
+    karyon_sdk.register_endpoint(wallet, config.assigned_netuid, config.serve_endpoint)
+
+    await start_agent_loop(agent_id, wallet, config)
+
+async def retire_agent(agent_id: str, wallet: PsiloWallet):
+    # Deregister endpoint before unstaking
+    karyon_sdk.deregister_endpoint(wallet)
+    # ... existing retirement logic ...
+```
+
+#### Sandbox isolation for subnet task execution
+
+Code generation (netuid 2) and structured data extraction (netuid 3) subnets execute untrusted code as part of scoring. Motus's `DockerSandbox` provides the isolation layer:
+
+```python
+from motus.tools.providers.docker import DockerSandbox
+
+@agent_task(retries=2, timeout=60.0)
+async def score_code_submission(submission: CodeSubmission) -> float:
+    """Score a netuid 2 code submission against randomized test harnesses."""
+    async with await DockerSandbox.acreate("python:3.12") as sb:
+        # Copy submission into container
+        await sb.put(submission.file_path, "/workspace/solution.py")
+        # Run against test harness (generated fresh each epoch)
+        result = await sb.python(f"""
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("sol", "/workspace/solution.py")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+results = run_test_harness(mod, tests={submission.test_harness!r})
+print(json.dumps(results))
+        """)
+        scores = json.loads(result)
+        return compute_final_score(scores)
+    # Container destroyed automatically on exit
+```
+
 ---
 
 ## 4. Psilo Integration
@@ -1354,7 +1505,7 @@ This is the deepest open question in the entire design. The answer likely involv
 - Bittensor Whitepaper: https://bittensor.com/whitepaper
 - Substrate Documentation: https://docs.substrate.io
 - Psilo Protocol: https://psiloai.com
-- Mitosis Agent Spawning Protocol: [internal docs]
+- Motus Agent Serving Runtime: https://github.com/lithos-ai/motus
 - Goodhart's Law and Mechanism Design: Manheim & Garrabrant (2018)
 
 ---
