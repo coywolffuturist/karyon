@@ -18,7 +18,7 @@
    - [3.1 Agent Lifecycle](#31-agent-lifecycle)
    - [3.2 Sub-Agent Spawning for Subnet Specialization](#32-sub-agent-spawning-for-subnet-specialization)
    - [3.3 Agent Retirement](#33-agent-retirement)
-   - [3.4 Motus Integration: Agent Serving & Task Orchestration](#34-motus-integration-agent-serving--task-orchestration)
+   - [3.4 Agent Serving & Task Orchestration (karyon-sdk native)](#34-agent-serving--task-orchestration-karyon-sdk-native)
 4. [Psilo Integration](#4-psilo-integration)
 5. [Token Economics](#5-token-economics)
 6. [Subnet Architecture](#6-subnet-architecture)
@@ -779,152 +779,344 @@ async def retire_agent(agent_id: str, wallet: PsiloWallet):
     await mitosis.terminate(agent_id)
 ```
 
-### 3.4 Motus Integration: Agent Serving & Task Orchestration
+### 3.4 Agent Serving & Task Orchestration (karyon-sdk native)
 
-Karyon agents need to serve subnet tasks reliably, in parallel, and at scale. [Motus](https://github.com/lithos-ai/motus) is the serving and orchestration runtime that handles this layer — exposing each agent as a session-based HTTP endpoint, scheduling parallel task execution, and managing retries, timeouts, and tracing. Rather than building this infrastructure inside Karyon or Mitosis, the recommended pattern is to mount each Karyon agent on a Motus serving instance.
+Karyon agents must serve subnet tasks reliably, in parallel, and at scale — without depending on any external serving runtime. All serving, task scheduling, sandbox isolation, and context compaction are implemented natively inside `karyon-sdk`. The only runtime dependencies are Python's standard library, `asyncio`, `aiohttp`, and `docker` (all well-maintained, non-opinionated primitives).
 
-#### Why Motus
+> **Design principle:** Karyon controls its full stack. External serving frameworks introduce upgrade coupling, API drift risk, and potential for unilateral breaking changes by a third party. The patterns below are inspired by open-source research (including lithos-ai/motus) but are implemented and owned entirely within this repository.
 
-- **`motus serve`** exposes any agent as a session-based HTTP API with a single command. Subnet validators and miners each run as Motus-served instances, callable from the chain or from other agents.
-- **`@agent_task` parallel runtime** infers a dependency graph from data flow and executes independent branches concurrently without explicit DAG declaration. Subnet tasks that can be parallelized (e.g. fetching + scoring in parallel) get this automatically.
-- **Docker sandbox execution** — `DockerSandbox` runs tool calls (bash, file ops, code execution) in isolated containers. This replaces host-level subprocess execution, eliminating an entire class of injection vulnerabilities.
-- **CompactionMemory** — automatic LLM-based context compaction with JSONL session persistence and restore. Agents can crash and resume without losing conversation state.
-- **Built-in guardrails** — input/output validation at both the agent and individual tool level, with clean tripwire exceptions. Sits directly in the subnet task pipeline.
+#### 3.4.1 Native Agent Serving (`karyon_sdk.serve`)
 
-#### Serving pattern
-
-Each agent registered on a Karyon subnet is served via Motus:
+Each registered agent exposes itself as a session-based HTTP API via `karyon_sdk.serve`. Validators discover miner endpoints via an on-chain registry; no external service registry is required.
 
 ```python
-from motus.agent import ReActAgent
-from motus.models import AnthropicChatClient
-from motus.memory import CompactionMemory
-from motus.tools import tool
-from karyon_sdk import SubnetTaskProvider
+# karyon_sdk/serve/server.py
+import asyncio
+import json
+import uuid
+from aiohttp import web
+from karyon_sdk.agent import AgentLoop
 
-# Subnet task provider wraps the Karyon task queue as a Motus tool
-task_provider = SubnetTaskProvider(netuid=2, wallet=wallet)
+class AgentServer:
+    """
+    Lightweight session-based HTTP server for Karyon subnet agents.
+    No external framework dependency — pure aiohttp.
+    
+    Each POST /chat creates or resumes a session.
+    Sessions are keyed by session_id; state is held in-process + persisted to JSONL.
+    """
 
-agent = ReActAgent(
-    client=AnthropicChatClient(),
-    model_name="claude-sonnet-4-5",
-    tools=[task_provider],
-    memory=CompactionMemory(),  # survives restarts; auto-compacts at token budget
-)
+    def __init__(self, agent: AgentLoop, host: str = "0.0.0.0", port: int = 8080):
+        self.agent = agent
+        self.host = host
+        self.port = port
+        self._sessions: dict[str, AgentSession] = {}
+        self._app = web.Application()
+        self._app.router.add_post("/chat", self._handle_chat)
+        self._app.router.add_get("/health", self._handle_health)
+
+    async def _handle_chat(self, request: web.Request) -> web.Response:
+        body = await request.json()
+        session_id = body.get("session_id") or str(uuid.uuid4())
+        message = body["message"]
+
+        session = self._sessions.setdefault(session_id, AgentSession(session_id, self.agent))
+        response = await session.send(message)
+        return web.json_response({"session_id": session_id, "response": response})
+
+    async def _handle_health(self, request: web.Request) -> web.Response:
+        return web.json_response({"status": "ok", "agent_id": self.agent.agent_id})
+
+    async def start(self):
+        runner = web.AppRunner(self._app)
+        await runner.setup()
+        site = web.TCPSite(runner, self.host, self.port)
+        await site.start()
 ```
 
-```bash
-# Expose agent as session-based HTTP API
-motus serve start karyon_agent:agent --port 8080
-
-# Validators call the miner's Motus endpoint directly
-motus serve chat http://miner-agent.internal:8080 "solve task #4821"
-```
-
-#### Parallel subnet task execution
-
-Motus's `@agent_task` decorator handles parallel execution of independent subnet tasks:
-
-```python
-from motus.runtime import resolve
-from motus.runtime.agent_task import agent_task
-
-@agent_task
-async def fetch_task(task_id: str) -> SubnetTask:
-    """Fetch task definition from Karyon task queue."""
-    return await karyon_sdk.get_task(task_id)
-
-@agent_task(retries=3, timeout=30.0)
-async def execute_task(task: SubnetTask) -> TaskResult:
-    """Execute the task in a sandboxed environment."""
-    async with await DockerSandbox.acreate() as sb:
-        return await run_in_sandbox(sb, task)
-
-@agent_task
-async def score_result(result: TaskResult) -> float:
-    """Score the result against the subnet objective function."""
-    return await objective_fn.score(result)
-
-@agent_task
-async def submit_result(result: TaskResult, score: float) -> None:
-    """Submit scored result to the chain."""
-    await karyon_sdk.submit(result, score)
-
-# Motus infers: fetch → execute → (score || submit dependencies)
-# execute and score are independent once result is ready — run in parallel
-async def serve_task_batch(task_ids: list[str]):
-    for task_id in task_ids:
-        task = fetch_task(task_id)
-        result = execute_task(task)
-        score = score_result(result)
-        await resolve(submit_result(result, score))
-```
-
-#### Motus Cloud deployment
-
-For agents running at scale without managing infrastructure:
-
-```bash
-# Deploy agent to Motus Cloud
-motus deploy --name karyon-miner-netuid2 karyon_agent:agent
-
-# Agent is reachable at https://karyon-miner-netuid2.lithosai.com
-# Validators resolve miner endpoints via the chain + Motus Cloud URL
-```
-
-#### Integration with Mitosis lifecycle
-
-Motus serving is started and stopped as part of the Mitosis agent lifecycle:
+Integrated into the Mitosis agent lifecycle:
 
 ```python
 async def on_agent_spawn(agent_id: str, config: AgentConfig):
     wallet = PsiloWallet.create(agent_id=agent_id)
     # ... wallet funding and chain registration ...
 
-    # Start Motus serving process alongside the agent loop
-    motus_process = await start_motus_serve(
-        agent_module=f"karyon_agents.netuid{config.assigned_netuid}:agent",
-        port=config.serve_port,
-    )
-    config.serve_endpoint = f"http://localhost:{config.serve_port}"
+    agent_loop = AgentLoop(agent_id, wallet, config)
+    server = AgentServer(agent_loop, port=config.serve_port)
+    await server.start()
 
-    # Register serve endpoint on chain so validators can discover miners
-    karyon_sdk.register_endpoint(wallet, config.assigned_netuid, config.serve_endpoint)
-
-    await start_agent_loop(agent_id, wallet, config)
+    # Register endpoint on-chain — validators resolve miners from this
+    karyon_sdk.register_endpoint(wallet, config.assigned_netuid,
+                                 f"http://{config.host}:{config.serve_port}")
+    await agent_loop.run()
 
 async def retire_agent(agent_id: str, wallet: PsiloWallet):
-    # Deregister endpoint before unstaking
-    karyon_sdk.deregister_endpoint(wallet)
+    karyon_sdk.deregister_endpoint(wallet)  # deregister before unstaking
     # ... existing retirement logic ...
 ```
 
-#### Sandbox isolation for subnet task execution
+#### 3.4.2 Parallel Task Execution (`karyon_sdk.runtime`)
 
-Code generation (netuid 2) and structured data extraction (netuid 3) subnets execute untrusted code as part of scoring. Motus's `DockerSandbox` provides the isolation layer:
+Subnet task pipelines have natural parallelism: fetch, execute, and score steps often have independent branches that can run concurrently. The `@subnet_task` decorator (native to `karyon-sdk`) wraps async functions as dependency-aware tasks and submits them to an `asyncio`-based scheduler. No external framework required.
 
 ```python
-from motus.tools.providers.docker import DockerSandbox
+# karyon_sdk/runtime/task.py
+import asyncio
+import dataclasses
+import functools
+from typing import Any, Callable, TypeVar
 
-@agent_task(retries=2, timeout=60.0)
-async def score_code_submission(submission: CodeSubmission) -> float:
-    """Score a netuid 2 code submission against randomized test harnesses."""
-    async with await DockerSandbox.acreate("python:3.12") as sb:
-        # Copy submission into container
-        await sb.put(submission.file_path, "/workspace/solution.py")
-        # Run against test harness (generated fresh each epoch)
-        result = await sb.python(f"""
-import importlib.util, json, sys
-spec = importlib.util.spec_from_file_location("sol", "/workspace/solution.py")
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-results = run_test_harness(mod, tests={submission.test_harness!r})
-print(json.dumps(results))
-        """)
-        scores = json.loads(result)
-        return compute_final_score(scores)
-    # Container destroyed automatically on exit
+R = TypeVar("R")
+
+@dataclasses.dataclass
+class TaskPolicy:
+    retries: int = 0
+    timeout: float | None = None
+    retry_delay: float = 0.0
+
+def subnet_task(
+    func: Callable | None = None,
+    *,
+    retries: int = 0,
+    timeout: float | None = None,
+    retry_delay: float = 0.0,
+):
+    """
+    Decorator that wraps an async function as a retryable, timeout-bound subnet task.
+    Returns an asyncio.Task when called — callers await the result via the task handle.
+    Independent tasks submitted in the same event loop iteration run in parallel.
+    """
+    policy = TaskPolicy(retries=retries, timeout=timeout, retry_delay=retry_delay)
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            return asyncio.ensure_future(_run_with_policy(fn, args, kwargs, policy))
+        return wrapper
+
+    return decorator(func) if func is not None else decorator
+
+
+async def _run_with_policy(fn, args, kwargs, policy: TaskPolicy):
+    last_exc = None
+    for attempt in range(policy.retries + 1):
+        try:
+            coro = fn(*args, **kwargs)
+            if policy.timeout:
+                return await asyncio.wait_for(coro, timeout=policy.timeout)
+            return await coro
+        except asyncio.TimeoutError as e:
+            raise
+        except Exception as e:
+            last_exc = e
+            if attempt < policy.retries:
+                await asyncio.sleep(policy.retry_delay)
+    raise last_exc
 ```
+
+Usage — independent tasks in the pipeline run in parallel automatically:
+
+```python
+from karyon_sdk.runtime import subnet_task
+
+@subnet_task
+async def fetch_task(task_id: str) -> SubnetTask:
+    return await karyon_sdk.get_task(task_id)
+
+@subnet_task(retries=3, timeout=30.0)
+async def execute_task(task: SubnetTask) -> TaskResult:
+    async with Sandbox.create() as sb:
+        return await run_in_sandbox(sb, task)
+
+@subnet_task
+async def score_result(result: TaskResult) -> float:
+    return await objective_fn.score(result)
+
+async def serve_task_batch(task_ids: list[str]):
+    for task_id in task_ids:
+        task_handle = fetch_task(task_id)           # starts immediately
+        task = await task_handle
+        result_handle = execute_task(task)
+        score_handle = score_result(await result_handle)  # parallel with submit setup
+        result, score = await asyncio.gather(result_handle, score_handle)
+        await karyon_sdk.submit(result, score)
+```
+
+#### 3.4.3 Sandbox Isolation (`karyon_sdk.sandbox`)
+
+Subnets that score code submissions (netuid 2) or process untrusted structured data (netuid 3) must isolate execution. The `Sandbox` abstraction wraps Docker directly via the `docker` Python SDK — no intermediate framework layer.
+
+```python
+# karyon_sdk/sandbox/docker_sandbox.py
+import asyncio
+import docker
+import tarfile
+from io import BytesIO
+from typing import Mapping
+
+class Sandbox:
+    """
+    Thin Docker wrapper for isolated task execution.
+    Dependency: docker SDK only (pip install docker).
+    Lifecycle: use as async context manager — container destroyed on exit.
+    """
+
+    def __init__(self, container, *, owns: bool = True):
+        self._container = container
+        self._owns = owns
+
+    @classmethod
+    async def create(cls, image: str = "python:3.12",
+                     env: Mapping[str, str] | None = None) -> "Sandbox":
+        client = docker.from_env()
+        container = await asyncio.to_thread(
+            client.containers.run,
+            image, stdin_open=True, detach=True, environment=env,
+            network_mode="none",   # no network access for untrusted code
+        )
+        return cls(container)
+
+    async def exec(self, *cmd: str, input: str | None = None) -> str:
+        """Run a command inside the container and return stdout."""
+        api = self._container.client.api
+        e = api.exec_create(self._container.id, cmd, stdin=(input is not None))
+        result = await asyncio.to_thread(api.exec_start, e["Id"])
+        return result.decode()
+
+    async def python(self, script: str) -> str:
+        return await self.exec("python3", "-c", script)
+
+    async def put(self, local_path: str, container_path: str) -> None:
+        data = BytesIO()
+        with tarfile.open(fileobj=data, mode="w") as tar:
+            tar.add(local_path, arcname=container_path.lstrip("/"))
+        data.seek(0)
+        await asyncio.to_thread(self._container.put_archive, "/", data)
+
+    async def aclose(self):
+        if self._owns:
+            await asyncio.to_thread(self._container.stop)
+            await asyncio.to_thread(self._container.remove)
+
+    async def __aenter__(self): return self
+    async def __aexit__(self, *_): await self.aclose()
+```
+
+Usage in the netuid 2 scoring pipeline:
+
+```python
+from karyon_sdk.sandbox import Sandbox
+
+@subnet_task(retries=2, timeout=60.0)
+async def score_code_submission(submission: CodeSubmission) -> float:
+    async with await Sandbox.create("python:3.12") as sb:
+        await sb.put(submission.file_path, "/workspace/solution.py")
+        result = await sb.python(f"""
+import importlib.util, json
+spec = importlib.util.spec_from_file_location("sol", "/workspace/solution.py")
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+print(json.dumps(run_test_harness(mod, tests={submission.test_harness!r})))
+        """)
+        return compute_final_score(json.loads(result))
+    # Container stopped and removed automatically
+```
+
+#### 3.4.4 Context Compaction (`karyon_sdk.memory`)
+
+Agents are long-running processes. Context windows fill up. `CompactionMemory` auto-summarizes conversation history when the token budget reaches a configurable threshold, persists the full log to JSONL, and restores on restart — no external memory service required.
+
+```python
+# karyon_sdk/memory/compaction.py
+import json
+import uuid
+from pathlib import Path
+from karyon_sdk.models import ChatClient, ChatMessage
+
+class CompactionMemory:
+    """
+    LLM-based context compaction with JSONL session persistence.
+    
+    When token count exceeds safety_ratio * model_context_limit,
+    condenses older messages into a summary and continues with headroom.
+    Full message log is always preserved on disk for audit and restore.
+    
+    No external dependency — uses the same ChatClient already in karyon-sdk.
+    """
+
+    def __init__(self, log_dir: str = "./agent_logs",
+                 safety_ratio: float = 0.75,
+                 session_id: str | None = None):
+        self.safety_ratio = safety_ratio
+        self.session_id = session_id or str(uuid.uuid4())
+        self._log_path = Path(log_dir) / f"{self.session_id}.jsonl"
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._messages: list[ChatMessage] = []
+        self._client: ChatClient | None = None
+
+    def set_client(self, client: ChatClient, model_name: str):
+        self._client = client
+        self._model_name = model_name
+        self._token_limit = client.context_limit(model_name)
+
+    async def add(self, message: ChatMessage):
+        self._messages.append(message)
+        self._append_log({"type": "message", "message": message.model_dump()})
+        await self._maybe_compact()
+
+    async def _maybe_compact(self):
+        token_count = sum(self._estimate_tokens(m) for m in self._messages)
+        if token_count < self._token_limit * self.safety_ratio:
+            return
+        # Summarize all but the last 2 messages
+        to_compact = self._messages[:-2]
+        summary = await self._summarize(to_compact)
+        summary_msg = ChatMessage(role="system",
+                                  content=f"[Conversation summary]: {summary}")
+        self._messages = [summary_msg] + self._messages[-2:]
+        self._append_log({"type": "compaction", "summary": summary,
+                          "messages_compacted": len(to_compact)})
+
+    async def _summarize(self, messages: list[ChatMessage]) -> str:
+        prompt = "Summarize the following conversation concisely, preserving key decisions, facts, and open questions:\n\n"
+        prompt += "\n".join(f"{m.role}: {m.content}" for m in messages)
+        response = await self._client.complete([ChatMessage(role="user", content=prompt)],
+                                               model=self._model_name)
+        return response.content
+
+    def _estimate_tokens(self, msg: ChatMessage) -> int:
+        return len(msg.content) // 4  # rough approximation; replace with tiktoken if available
+
+    def _append_log(self, entry: dict):
+        with open(self._log_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    @classmethod
+    def restore(cls, session_id: str, log_dir: str = "./agent_logs") -> "CompactionMemory":
+        """Restore a previous session from its JSONL log."""
+        mem = cls(log_dir=log_dir, session_id=session_id)
+        log_path = Path(log_dir) / f"{session_id}.jsonl"
+        for line in log_path.read_text().splitlines():
+            entry = json.loads(line)
+            if entry["type"] == "message":
+                mem._messages.append(ChatMessage(**entry["message"]))
+            elif entry["type"] == "compaction":
+                summary_msg = ChatMessage(role="system",
+                                          content=f"[Conversation summary]: {entry['summary']}")
+                mem._messages = [summary_msg]
+        return mem
+```
+
+#### 3.4.5 Karyon-SDK dependency summary
+
+All serving infrastructure is self-contained in `karyon-sdk`. External dependencies are limited to well-maintained, stable primitives:
+
+| Component | Dependency | Rationale |
+|-----------|-----------|-----------|
+| HTTP serving | `aiohttp` | Maintained by aio-libs; no framework lock-in |
+| Sandbox isolation | `docker` SDK | Official Docker client; replaceable with podman |
+| Task scheduling | `asyncio` (stdlib) | Zero dependency |
+| Context compaction | `karyon-sdk` `ChatClient` (already present) | Reuses existing model abstraction |
+| Session persistence | stdlib `json`, `pathlib` | Zero dependency |
 
 ---
 
@@ -1505,7 +1697,7 @@ This is the deepest open question in the entire design. The answer likely involv
 - Bittensor Whitepaper: https://bittensor.com/whitepaper
 - Substrate Documentation: https://docs.substrate.io
 - Psilo Protocol: https://psiloai.com
-- Motus Agent Serving Runtime: https://github.com/lithos-ai/motus
+- Motus (lithos-ai/motus) — reference implementation for agent serving patterns (not a dependency)
 - Goodhart's Law and Mechanism Design: Manheim & Garrabrant (2018)
 
 ---
